@@ -677,6 +677,76 @@ class TestModule1SystemAuditor(unittest.TestCase):
             self.assertTrue(required.issubset(finding.keys()))
             self.assertEqual(finding["module"], "module_1")
 
+    def test_merge_preserves_module2_findings(self):
+        """Overlap-safe writer must keep Module 2 findings when updating findings.json."""
+        import tempfile
+
+        existing = {
+            "scan_metadata": {"hostname": "old"},
+            "findings": [
+                {
+                    "rule_id": "NET_FW_001",
+                    "module": "module_2",
+                    "category": "Network Exposure",
+                    "check_name": "Unrestricted Exposed Service",
+                    "status": "FAILED",
+                    "severity": "CRITICAL",
+                    "current_value": "Firewall Inactive",
+                    "expected_value": "Firewall Active",
+                    "target_file": "active_firewall",
+                    "remediation_script": "remediate_firewall.sh",
+                },
+                {
+                    "rule_id": "SYS_SSH_001",
+                    "module": "module_1",
+                    "category": "Authentication",
+                    "check_name": "SSH Root Login Enabled",
+                    "status": "FAILED",
+                    "severity": "HIGH",
+                    "current_value": "PermitRootLogin yes",
+                    "expected_value": "PermitRootLogin no",
+                    "target_file": "/etc/ssh/sshd_config",
+                    "remediation_script": "remediate_ssh.sh",
+                },
+            ],
+        }
+        new_mod1 = [
+            {
+                "rule_id": "SYS_SSH_001",
+                "module": "module_1",
+                "category": "Authentication",
+                "check_name": "SSH Root Login Hardened",
+                "status": "PASSED",
+                "severity": "INFO",
+                "current_value": "PermitRootLogin no",
+                "expected_value": "PermitRootLogin no",
+                "target_file": "/etc/ssh/sshd_config.d/99-defensys.conf",
+                "remediation_script": "remediate_ssh.sh",
+            }
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "findings.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(existing, handle)
+            payload = merge_findings_payload(
+                new_mod1,
+                path,
+                {"hostname": "kali-sec-node", "os_name": "Kali Linux"},
+            )
+            modules = {item["module"] for item in payload["findings"]}
+            self.assertIn("module_2", modules)
+            self.assertIn("module_1", modules)
+            self.assertEqual(
+                sum(1 for item in payload["findings"] if item["module"] == "module_1"),
+                1,
+            )
+            self.assertEqual(
+                next(item for item in payload["findings"] if item["rule_id"] == "SYS_SSH_001")[
+                    "status"
+                ],
+                "PASSED",
+            )
+
 
 def run_tests() -> bool:
     """Executes the test suite and returns True if all tests pass."""
