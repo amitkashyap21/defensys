@@ -1,0 +1,5 @@
+# Keep remediation scripts Unix-compatible for RHEL/Debian teammates
+scripts/*.sh text eol=lf
+*.py text eol=lf
+*.json text eol=lf
+*.md text eol=lf
