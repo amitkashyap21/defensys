@@ -11,16 +11,22 @@ Scope & Capabilities:
   vs. restricted loopback bindings (127.0.0.1, ::1).
 - Dynamic firewall manager detection (firewalld, ufw, nftables, iptables).
 - Firewall status & inbound policy auditing (default drop/deny vs permissive accept).
-- Correlation between open sockets and firewall rules to identify truly exposed attack surfaces.
+- Correlation between open sockets and firewall rules to identify exposed attack surfaces.
 - Generation of structured findings adhering strictly to the DefenSys JSON Data Contract.
+- Built-in verification test suite and multi-distro simulation engine.
 """
 
+import argparse
 import json
 import logging
 import os
+import platform
 import re
 import shutil
+import socket
 import subprocess
+import sys
+import unittest
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -349,31 +355,26 @@ class NetworkAuditor:
             info.raw_output = stdout.strip()
             if code == 0 and "running" in stdout:
                 info.is_active = True
-                # Query default zone
                 _, zone_out, _ = self.run_cmd(["firewall-cmd", "--get-default-zone"])
                 def_zone = zone_out.strip() or "public"
                 info.active_zones = [def_zone]
 
-                # Query open services in default zone
                 _, srv_out, _ = self.run_cmd(["firewall-cmd", f"--zone={def_zone}", "--list-services"])
                 if srv_out.strip():
                     info.open_services = srv_out.strip().split()
 
-                # Query open ports in default zone
                 _, prt_out, _ = self.run_cmd(["firewall-cmd", f"--zone={def_zone}", "--list-ports"])
                 if prt_out.strip():
                     info.open_ports = prt_out.strip().split()
 
-                # In firewalld, unallowed inbound packets are rejected by default
                 info.default_inbound_policy = "REJECT"
 
-                # Check if systemd service is enabled
                 _, en_out, _ = self.run_cmd(["systemctl", "is-enabled", "firewalld"])
                 info.is_enabled = (en_out.strip() == "enabled")
                 return info
             else:
                 info.is_active = False
-                info.default_inbound_policy = "ACCEPT"  # Inactive firewall permits all
+                info.default_inbound_policy = "ACCEPT"
                 return info
 
         # 2. Test UFW (Kali Linux / Ubuntu / Debian)
@@ -384,7 +385,6 @@ class NetworkAuditor:
             if code == 0:
                 if "Status: active" in stdout:
                     info.is_active = True
-                    # Check default incoming policy
                     if "deny (incoming)" in stdout:
                         info.default_inbound_policy = "DENY"
                     elif "reject (incoming)" in stdout:
@@ -394,7 +394,6 @@ class NetworkAuditor:
                     else:
                         info.default_inbound_policy = "DENY"
 
-                    # Parse open ports
                     for line in stdout.splitlines():
                         if "ALLOW IN" in line:
                             rule_part = line.split("ALLOW IN")[0].strip()
@@ -412,7 +411,6 @@ class NetworkAuditor:
             code, stdout, _ = self.run_cmd(["systemctl", "is-active", "nftables"])
             if code == 0 and "active" in stdout:
                 info.is_active = True
-                # Check ruleset for input hook policy
                 _, rset, _ = self.run_cmd(["nft", "list", "ruleset"])
                 info.raw_output = rset
                 if "hook input" in rset and ("policy drop" in rset or "drop;" in rset):
@@ -461,11 +459,9 @@ class NetworkAuditor:
 
         # Check 1: Inactive / Disabled Firewall (NET_FW_001)
         if not fw_info.is_active:
-            # Check if exposed services exist
             exposed_count = sum(1 for s in sockets if s.is_exposed)
             exposed_desc = f"{exposed_count} listening service(s) exposed" if exposed_count > 0 else "no listening services exposed"
 
-            # Check specifically for SSH or critical services
             ssh_sock = next((s for s in sockets if s.local_port == 22 and s.is_exposed), None)
             if ssh_sock:
                 current_val = f"Port 22 listening on {ssh_sock.local_address} (Firewall Inactive - {fw_info.manager})"
@@ -526,7 +522,7 @@ class NetworkAuditor:
                     "remediation_script": "remediate_firewall.sh",
                 })
 
-        # Check 3: Socket-level Audits (Insecure protocols, databases, wildcards)
+        # Check 3: Socket-level Audits
         for sock in sockets:
             if not sock.is_exposed:
                 continue
@@ -601,6 +597,40 @@ class NetworkAuditor:
         return findings
 
 
+def build_scan_metadata(os_info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Builds scan metadata adhering to data/findings.json contract."""
+    hostname = socket.gethostname()
+    os_name = "Linux"
+    os_family = "generic"
+    kernel_version = platform.release()
+
+    if os_info:
+        hostname = os_info.get("hostname", hostname)
+        os_name = os_info.get("os_name", os_name)
+        os_family = os_info.get("os_family", os_family)
+        kernel_version = os_info.get("kernel_version", kernel_version)
+    elif os.path.exists("/etc/os-release"):
+        try:
+            with open("/etc/os-release", "r") as f:
+                for line in f:
+                    if line.startswith("PRETTY_NAME="):
+                        os_name = line.split("=", 1)[1].strip().strip('"')
+                    elif line.startswith("ID_LIKE="):
+                        os_family = line.split("=", 1)[1].strip().strip('"')
+                    elif line.startswith("ID=") and os_family == "generic":
+                        os_family = line.split("=", 1)[1].strip().strip('"')
+        except Exception:
+            pass
+
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "hostname": hostname,
+        "os_name": os_name,
+        "os_family": os_family,
+        "kernel_version": kernel_version,
+    }
+
+
 # Public API wrapper for defensys main controller and teammates
 def audit_network(os_info: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """Entry point for DefenSys CLI to run Module 2 network auditing."""
@@ -613,20 +643,179 @@ def run_audit(os_info: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     return audit_network(os_info=os_info)
 
 
-if __name__ == "__main__":
+# ------------------------------------------------------------------------------
+# Built-in Verification Test Suite
+# ------------------------------------------------------------------------------
+class TestModule2NetworkAuditor(unittest.TestCase):
+    """Automated unit & regression tests for Module 2 Network Auditor."""
+
+    def test_ss_line_parsing_ipv4(self):
+        auditor = NetworkAuditor()
+        line = 'LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=842,fd=3))'
+        sock = auditor.parse_ss_line(line, "tcp")
+        self.assertIsNotNone(sock)
+        self.assertEqual(sock.local_address, "0.0.0.0")
+        self.assertEqual(sock.local_port, 22)
+        self.assertEqual(sock.process_name, "sshd")
+        self.assertEqual(sock.pid, 842)
+        self.assertTrue(sock.is_wildcard)
+        self.assertTrue(sock.is_exposed)
+
+    def test_ss_line_parsing_ipv6_brackets(self):
+        auditor = NetworkAuditor()
+        line = 'LISTEN 0 128 [::]:3306 [::]:* users:(("mysqld",pid=1120,fd=21))'
+        sock = auditor.parse_ss_line(line, "tcp")
+        self.assertIsNotNone(sock)
+        self.assertEqual(sock.local_address, "::")
+        self.assertEqual(sock.local_port, 3306)
+        self.assertEqual(sock.process_name, "mysqld")
+        self.assertTrue(sock.is_wildcard)
+
+    def test_loopback_isolation(self):
+        auditor = NetworkAuditor()
+        line = 'LISTEN 0 128 127.0.0.1:6379 0.0.0.0:* users:(("redis-server",pid=1024,fd=6))'
+        sock = auditor.parse_ss_line(line, "tcp")
+        self.assertIsNotNone(sock)
+        self.assertTrue(sock.is_loopback)
+        self.assertFalse(sock.is_exposed)
+
+    def test_rhel_firewalld_hardened_scenario(self):
+        mock_fw = FirewallInfo(
+            manager="firewalld",
+            is_installed=True,
+            is_active=True,
+            default_inbound_policy="REJECT",
+            open_ports=["22/tcp"],
+            open_services=["ssh"],
+        )
+        mock_socks = [
+            ListeningSocket(protocol="tcp", local_address="0.0.0.0", local_port=22, process_name="sshd", pid=842),
+            ListeningSocket(protocol="tcp", local_address="127.0.0.1", local_port=5432, process_name="postgres", pid=900),
+        ]
+        auditor = NetworkAuditor(mock_mode=True, mock_sockets=mock_socks, mock_firewall=mock_fw)
+        findings = auditor.audit_network()
+
+        # Should verify PASSED firewall enforcement
+        rule_001 = next(f for f in findings if f["rule_id"] == "NET_FW_001")
+        self.assertEqual(rule_001["status"], "PASSED")
+
+        rule_004 = next(f for f in findings if f["rule_id"] == "NET_FW_004")
+        self.assertEqual(rule_004["status"], "PASSED")
+
+    def test_kali_inactive_firewall_unrestricted_ssh(self):
+        mock_fw = FirewallInfo(
+            manager="ufw",
+            is_installed=True,
+            is_active=False,
+            default_inbound_policy="ACCEPT",
+        )
+        mock_socks = [
+            ListeningSocket(protocol="tcp", local_address="0.0.0.0", local_port=22, process_name="sshd", pid=842),
+            ListeningSocket(protocol="tcp", local_address="0.0.0.0", local_port=23, process_name="telnetd", pid=910),
+            ListeningSocket(protocol="tcp", local_address="0.0.0.0", local_port=3306, process_name="mysqld", pid=1120),
+        ]
+        auditor = NetworkAuditor(mock_mode=True, mock_sockets=mock_socks, mock_firewall=mock_fw)
+        findings = auditor.audit_network()
+
+        rule_ids = {f["rule_id"] for f in findings}
+        self.assertIn("NET_FW_001", rule_ids)
+        self.assertIn("NET_FW_002", rule_ids)
+        self.assertIn("NET_FW_003", rule_ids)
+
+        # Check exact contract fields
+        for f in findings:
+            self.assertEqual(f["module"], "module_2")
+            self.assertEqual(f["remediation_script"], "remediate_firewall.sh")
+            self.assertIn(f["status"], ["FAILED", "PASSED"])
+            self.assertIn(f["severity"], ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"])
+
+
+def run_tests() -> bool:
+    """Executes the test suite and returns True if all tests pass."""
+    suite = unittest.TestLoader().loadTestsFromTestCase(TestModule2NetworkAuditor)
+    runner = unittest.TextTestRunner(verbosity=2)
+    result = runner.run(suite)
+    return result.wasSuccessful()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="DefenSys Module 2 — Network & Firewall Security Auditor")
+    parser.add_argument("--audit", action="store_true", help="Run network & firewall security audit")
+    parser.add_argument("--json", action="store_true", help="Output audit results in DefenSys JSON contract format")
+    parser.add_argument("--output", type=str, help="Write JSON findings to target file (e.g. data/findings.json)")
+    parser.add_argument("--test", action="store_true", help="Run built-in automated test suite")
+    parser.add_argument("--mock-rhel", action="store_true", help="Simulate audit on a hardened RHEL 9 node")
+    parser.add_argument("--mock-kali", action="store_true", help="Simulate audit on an exposed Kali Linux node")
+
+    args = parser.parse_args()
+
+    if args.test:
+        print("[*] Running Module 2 Unit & Regression Test Suite...")
+        success = run_tests()
+        sys.exit(0 if success else 1)
+
     auditor = NetworkAuditor()
-    print("[*] DefenSys Module 2: Network & Firewall Security Auditor")
-    print(f"[*] Detecting Firewall Manager...")
-    fw = auditor.detect_firewall_manager()
-    print(f"    - Manager: {fw.manager}")
-    print(f"    - Installed: {fw.is_installed}")
-    print(f"    - Active: {fw.is_active}")
-    print(f"    - Default Inbound Policy: {fw.default_inbound_policy}")
 
-    print(f"[*] Scanning Listening Sockets...")
-    socks = auditor.get_listening_sockets()
-    print(f"    - Discovered {len(socks)} sockets.")
+    if args.mock_rhel:
+        mock_fw = FirewallInfo(
+            manager="firewalld",
+            is_installed=True,
+            is_active=True,
+            default_inbound_policy="REJECT",
+            open_ports=["22/tcp"],
+            open_services=["ssh"],
+        )
+        mock_socks = [
+            ListeningSocket(protocol="tcp", local_address="0.0.0.0", local_port=22, process_name="sshd", pid=842),
+            ListeningSocket(protocol="tcp", local_address="127.0.0.1", local_port=3306, process_name="mysqld", pid=1024),
+        ]
+        auditor = NetworkAuditor(mock_mode=True, mock_sockets=mock_socks, mock_firewall=mock_fw)
+        os_meta = {"hostname": "rhel-node-01", "os_name": "Red Hat Enterprise Linux 9.4", "os_family": "rhel"}
+    elif args.mock_kali:
+        mock_fw = FirewallInfo(manager="ufw", is_installed=True, is_active=False, default_inbound_policy="ACCEPT")
+        mock_socks = [
+            ListeningSocket(protocol="tcp", local_address="0.0.0.0", local_port=22, process_name="sshd", pid=842),
+            ListeningSocket(protocol="tcp", local_address="0.0.0.0", local_port=3306, process_name="mysqld", pid=1120),
+            ListeningSocket(protocol="tcp", local_address="0.0.0.0", local_port=23, process_name="in.telnetd", pid=1140),
+        ]
+        auditor = NetworkAuditor(mock_mode=True, mock_sockets=mock_socks, mock_firewall=mock_fw)
+        os_meta = {"hostname": "kali-sec-node", "os_name": "Kali Linux", "os_family": "debian"}
+    else:
+        os_meta = None
 
-    findings = auditor.audit_network()
-    print(f"[*] Audit Complete. Generated {len(findings)} findings.")
-    print(json.dumps(findings, indent=2))
+    findings = auditor.audit_network(os_info=os_meta)
+    metadata = build_scan_metadata(os_info=os_meta)
+
+    full_payload = {
+        "scan_metadata": metadata,
+        "findings": findings,
+    }
+
+    if args.output:
+        os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+        with open(args.output, "w") as f:
+            json.dump(full_payload, f, indent=2)
+        print(f"[+] Successfully wrote {len(findings)} findings to {args.output}")
+
+    if args.json or (not args.audit and not args.mock_rhel and not args.mock_kali and not args.output):
+        print(json.dumps(full_payload, indent=2))
+    else:
+        print("\n=======================================================")
+        print("   DefenSys — Module 2 Network Audit Summary Report    ")
+        print("=======================================================")
+        print(f"Target Host : {metadata['hostname']} ({metadata['os_name']})")
+        print(f"Timestamp   : {metadata['timestamp']}")
+        print(f"Total Checks: {len(findings)}")
+        print("-------------------------------------------------------")
+        for f in findings:
+            status_icon = "[PASS]" if f["status"] == "PASSED" else "[FAIL]"
+            print(f"{status_icon} [{f['severity']}] {f['rule_id']}: {f['check_name']}")
+            print(f"       Current : {f['current_value']}")
+            print(f"       Expected: {f['expected_value']}")
+            if f["status"] == "FAILED":
+                print(f"       Fix     : scripts/{f['remediation_script']}")
+            print("-------------------------------------------------------")
+
+
+if __name__ == "__main__":
+    main()
