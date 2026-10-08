@@ -9,9 +9,10 @@ Scope & Capabilities:
   protocols, PIDs, and process names.
 - Interface binding analysis detecting dangerous wildcard exposures (0.0.0.0, [::])
   vs. restricted loopback bindings (127.0.0.1, ::1).
-- Detection of sensitive databases/caches and legacy plaintext protocols exposed
-  to untrusted network interfaces.
-- Interface discovery via 'ip addr' / 'ip -j addr'.
+- Dynamic firewall manager detection (firewalld, ufw, nftables, iptables).
+- Firewall status & inbound policy auditing (default drop/deny vs permissive accept).
+- Correlation between open sockets and firewall rules to identify truly exposed attack surfaces.
+- Generation of structured findings adhering strictly to the DefenSys JSON Data Contract.
 """
 
 import json
@@ -62,7 +63,7 @@ SENSITIVE_SERVICES: Dict[int, Dict[str, str]] = {
     9200: {"name": "Elasticsearch", "desc": "Search engine API exposed without authentication", "severity": "HIGH"},
     2375: {"name": "Docker Daemon", "desc": "Unencrypted Docker REST API allowing root host takeover", "severity": "CRITICAL"},
     2379: {"name": "etcd", "desc": "Distributed key-value store cluster API exposed", "severity": "HIGH"},
-    9092: {"name": "Apache Kafka", "desc": "Message broker broker port exposed", "severity": "MEDIUM"},
+    9092: {"name": "Apache Kafka", "desc": "Message broker port exposed", "severity": "MEDIUM"},
 }
 
 
@@ -107,15 +108,35 @@ class NetworkInterface:
     is_loopback: bool = False
 
 
+@dataclass
+class FirewallInfo:
+    """Represents discovered host firewall manager state and policies."""
+    manager: str                       # 'firewalld', 'ufw', 'nftables', 'iptables', 'none'
+    is_installed: bool = False
+    is_active: bool = False
+    is_enabled: bool = False
+    default_inbound_policy: str = "UNKNOWN"  # 'DROP', 'REJECT', 'DENY', 'ACCEPT', 'UNKNOWN'
+    open_ports: List[str] = field(default_factory=list)        # e.g. ['22/tcp', '80/tcp']
+    open_services: List[str] = field(default_factory=list)     # e.g. ['ssh', 'cockpit']
+    active_zones: List[str] = field(default_factory=list)      # for firewalld e.g. ['public']
+    raw_output: str = ""
+
+
 class NetworkAuditor:
     """
     Core auditing engine for socket utilities, interface bindings,
-    and listening services across Linux distributions.
+    and adaptive firewall auditing across Linux distributions.
     """
 
-    def __init__(self, mock_mode: bool = False, mock_sockets: Optional[List[ListeningSocket]] = None):
+    def __init__(
+        self,
+        mock_mode: bool = False,
+        mock_sockets: Optional[List[ListeningSocket]] = None,
+        mock_firewall: Optional[FirewallInfo] = None,
+    ):
         self.mock_mode = mock_mode
         self._mock_sockets = mock_sockets or []
+        self._mock_firewall = mock_firewall
 
     def run_cmd(self, cmd: List[str], timeout: int = 5) -> Tuple[int, str, str]:
         """Executes a system shell command safely with timeout handling."""
@@ -137,6 +158,10 @@ class NetworkAuditor:
         except Exception as e:
             logger.error(f"Error executing {' '.join(cmd)}: {e}")
             return 1, "", str(e)
+
+    def is_tool_available(self, tool_name: str) -> bool:
+        """Checks if a binary executable exists in PATH."""
+        return shutil.which(tool_name) is not None
 
     def get_network_interfaces(self) -> List[NetworkInterface]:
         """Discovers network interfaces and assigned IP addresses via 'ip addr'."""
@@ -209,16 +234,13 @@ class NetworkAuditor:
         if len(parts) < 4:
             return None
 
-        # Look for local address:port column (typically index 3 or 4 depending on State column)
+        # Look for local address:port column
         local_col = ""
         process_col = ""
 
-        # In ss output with LISTEN state:
-        # State, Recv-Q, Send-Q, Local Address:Port, Peer Address:Port, Process
         for idx, part in enumerate(parts):
             if ":" in part and not part.startswith("users:"):
                 local_col = part
-                # The process information usually comes in later columns
                 process_col = " ".join(parts[idx + 2:]) if len(parts) > idx + 2 else ""
                 break
 
@@ -226,32 +248,28 @@ class NetworkAuditor:
             return None
 
         # Parse address and port
-        # Formats: 0.0.0.0:22, [::]:22, :::22, *:80, 127.0.0.1:3306, [::1]:8080
         local_address = "0.0.0.0"
         local_port = 0
 
         try:
             if local_col.startswith("["):
-                # IPv6 bracket notation: [::]:22 or [fe80::...]:80
                 bracket_end = local_col.rfind("]")
                 if bracket_end != -1:
                     local_address = local_col[1:bracket_end]
                     port_str = local_col[bracket_end + 2:]
                     local_port = int(port_str)
             elif local_col.count(":") > 1:
-                # Raw IPv6 notation: :::22 or fe80::1:80
                 last_colon = local_col.rfind(":")
                 local_address = local_col[:last_colon]
                 local_port = int(local_col[last_colon + 1:])
             else:
-                # IPv4 or wildcard: 0.0.0.0:22 or *:80
                 addr_part, port_part = local_col.rsplit(":", 1)
                 local_address = addr_part if addr_part != "*" else "0.0.0.0"
                 local_port = int(port_part)
         except (ValueError, IndexError):
             return None
 
-        # Parse process name and PID from users:(("sshd",pid=842,fd=3))
+        # Parse process name and PID
         process_name = "unknown"
         pid = None
 
@@ -291,7 +309,7 @@ class NetworkAuditor:
                 if sock:
                     sockets.append(sock)
         else:
-            # Fallback without -p if permission denied or non-root
+            # Fallback without -p if non-root
             code_np, stdout_np, _ = self.run_cmd(["ss", "-tln"])
             if code_np == 0:
                 for line in stdout_np.splitlines():
@@ -316,13 +334,199 @@ class NetworkAuditor:
 
         return sockets
 
-    def audit_socket_exposures(self, sockets: List[ListeningSocket]) -> List[Dict[str, Any]]:
+    def detect_firewall_manager(self) -> FirewallInfo:
         """
-        Audits listening sockets for dangerous bindings and cleartext/database exposures.
-        Generates findings adhering to the DefenSys schema contract.
+        Dynamically detects the active firewall manager (firewalld, ufw, nftables, iptables)
+        and extracts status, default policies, and open rules.
+        """
+        if self.mock_mode and self._mock_firewall:
+            return self._mock_firewall
+
+        # 1. Test Firewalld (RHEL / CentOS / Fedora / Rocky / Alma)
+        if self.is_tool_available("firewall-cmd"):
+            info = FirewallInfo(manager="firewalld", is_installed=True)
+            code, stdout, _ = self.run_cmd(["firewall-cmd", "--state"])
+            info.raw_output = stdout.strip()
+            if code == 0 and "running" in stdout:
+                info.is_active = True
+                # Query default zone
+                _, zone_out, _ = self.run_cmd(["firewall-cmd", "--get-default-zone"])
+                def_zone = zone_out.strip() or "public"
+                info.active_zones = [def_zone]
+
+                # Query open services in default zone
+                _, srv_out, _ = self.run_cmd(["firewall-cmd", f"--zone={def_zone}", "--list-services"])
+                if srv_out.strip():
+                    info.open_services = srv_out.strip().split()
+
+                # Query open ports in default zone
+                _, prt_out, _ = self.run_cmd(["firewall-cmd", f"--zone={def_zone}", "--list-ports"])
+                if prt_out.strip():
+                    info.open_ports = prt_out.strip().split()
+
+                # In firewalld, unallowed inbound packets are rejected by default
+                info.default_inbound_policy = "REJECT"
+
+                # Check if systemd service is enabled
+                _, en_out, _ = self.run_cmd(["systemctl", "is-enabled", "firewalld"])
+                info.is_enabled = (en_out.strip() == "enabled")
+                return info
+            else:
+                info.is_active = False
+                info.default_inbound_policy = "ACCEPT"  # Inactive firewall permits all
+                return info
+
+        # 2. Test UFW (Kali Linux / Ubuntu / Debian)
+        if self.is_tool_available("ufw"):
+            info = FirewallInfo(manager="ufw", is_installed=True)
+            code, stdout, _ = self.run_cmd(["ufw", "status", "verbose"])
+            info.raw_output = stdout.strip()
+            if code == 0:
+                if "Status: active" in stdout:
+                    info.is_active = True
+                    # Check default incoming policy
+                    if "deny (incoming)" in stdout:
+                        info.default_inbound_policy = "DENY"
+                    elif "reject (incoming)" in stdout:
+                        info.default_inbound_policy = "REJECT"
+                    elif "allow (incoming)" in stdout:
+                        info.default_inbound_policy = "ACCEPT"
+                    else:
+                        info.default_inbound_policy = "DENY"
+
+                    # Parse open ports
+                    for line in stdout.splitlines():
+                        if "ALLOW IN" in line:
+                            rule_part = line.split("ALLOW IN")[0].strip()
+                            if rule_part:
+                                info.open_ports.append(rule_part)
+                    return info
+                else:
+                    info.is_active = False
+                    info.default_inbound_policy = "ACCEPT"
+                    return info
+
+        # 3. Test nftables
+        if self.is_tool_available("nft"):
+            info = FirewallInfo(manager="nftables", is_installed=True)
+            code, stdout, _ = self.run_cmd(["systemctl", "is-active", "nftables"])
+            if code == 0 and "active" in stdout:
+                info.is_active = True
+                # Check ruleset for input hook policy
+                _, rset, _ = self.run_cmd(["nft", "list", "ruleset"])
+                info.raw_output = rset
+                if "hook input" in rset and ("policy drop" in rset or "drop;" in rset):
+                    info.default_inbound_policy = "DROP"
+                else:
+                    info.default_inbound_policy = "ACCEPT"
+                return info
+
+        # 4. Test raw iptables
+        if self.is_tool_available("iptables"):
+            info = FirewallInfo(manager="iptables", is_installed=True)
+            code, stdout, _ = self.run_cmd(["iptables", "-S", "INPUT"])
+            info.raw_output = stdout.strip()
+            if code == 0:
+                info.is_active = True
+                if "-P INPUT DROP" in stdout:
+                    info.default_inbound_policy = "DROP"
+                elif "-P INPUT REJECT" in stdout:
+                    info.default_inbound_policy = "REJECT"
+                elif "-P INPUT ACCEPT" in stdout:
+                    info.default_inbound_policy = "ACCEPT"
+                return info
+
+        # 5. No firewall detected
+        return FirewallInfo(
+            manager="none",
+            is_installed=False,
+            is_active=False,
+            is_enabled=False,
+            default_inbound_policy="ACCEPT",
+            raw_output="No active firewall daemon found.",
+        )
+
+    def audit_network(self, os_info: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """
+        Performs a full audit of network sockets, interface bindings, and firewall status.
+        Generates findings strictly formatted to the DefenSys JSON Data Contract.
         """
         findings: List[Dict[str, Any]] = []
 
+        # 1. Discover sockets and firewall manager
+        sockets = self.get_listening_sockets()
+        fw_info = self.detect_firewall_manager()
+
+        logger.info(f"Discovered {len(sockets)} listening sockets. Firewall: {fw_info.manager} (Active={fw_info.is_active})")
+
+        # Check 1: Inactive / Disabled Firewall (NET_FW_001)
+        if not fw_info.is_active:
+            # Check if exposed services exist
+            exposed_count = sum(1 for s in sockets if s.is_exposed)
+            exposed_desc = f"{exposed_count} listening service(s) exposed" if exposed_count > 0 else "no listening services exposed"
+
+            # Check specifically for SSH or critical services
+            ssh_sock = next((s for s in sockets if s.local_port == 22 and s.is_exposed), None)
+            if ssh_sock:
+                current_val = f"Port 22 listening on {ssh_sock.local_address} (Firewall Inactive - {fw_info.manager})"
+            else:
+                current_val = f"Host firewall is INACTIVE/DISABLED ({fw_info.manager}) with {exposed_desc}"
+
+            findings.append({
+                "rule_id": "NET_FW_001",
+                "module": "module_2",
+                "category": "Network Exposure",
+                "check_name": "Unrestricted Exposed Service",
+                "status": "FAILED",
+                "severity": "CRITICAL",
+                "current_value": current_val,
+                "expected_value": "Firewall Active with restricted inbound ports",
+                "target_file": "active_firewall",
+                "remediation_script": "remediate_firewall.sh",
+            })
+        else:
+            findings.append({
+                "rule_id": "NET_FW_001",
+                "module": "module_2",
+                "category": "Network Exposure",
+                "check_name": "Active Firewall Enforcement",
+                "status": "PASSED",
+                "severity": "INFO",
+                "current_value": f"Firewall '{fw_info.manager}' is active and operational",
+                "expected_value": "Firewall Active with restricted inbound ports",
+                "target_file": "active_firewall",
+                "remediation_script": "remediate_firewall.sh",
+            })
+
+            # Check 2: Permissive Default Inbound Policy (NET_FW_004)
+            if fw_info.default_inbound_policy == "ACCEPT":
+                findings.append({
+                    "rule_id": "NET_FW_004",
+                    "module": "module_2",
+                    "category": "Firewall Security",
+                    "check_name": "Permissive Default Inbound Policy",
+                    "status": "FAILED",
+                    "severity": "HIGH",
+                    "current_value": f"Default incoming policy in {fw_info.manager} is ACCEPT (traffic allowed by default)",
+                    "expected_value": "Default incoming policy set to DROP or DENY",
+                    "target_file": "active_firewall",
+                    "remediation_script": "remediate_firewall.sh",
+                })
+            else:
+                findings.append({
+                    "rule_id": "NET_FW_004",
+                    "module": "module_2",
+                    "category": "Firewall Security",
+                    "check_name": "Default Inbound Policy Hardened",
+                    "status": "PASSED",
+                    "severity": "INFO",
+                    "current_value": f"Default incoming policy in {fw_info.manager} is {fw_info.default_inbound_policy}",
+                    "expected_value": "Default incoming policy set to DROP or DENY",
+                    "target_file": "active_firewall",
+                    "remediation_script": "remediate_firewall.sh",
+                })
+
+        # Check 3: Socket-level Audits (Insecure protocols, databases, wildcards)
         for sock in sockets:
             if not sock.is_exposed:
                 continue
@@ -332,7 +536,7 @@ class NetworkAuditor:
             proc = sock.process_name
             addr = sock.local_address
 
-            # Check 1: Insecure / Plaintext Protocol
+            # Check 3A: Insecure / Cleartext Protocols (NET_FW_003)
             if port in INSECURE_PROTOCOLS:
                 meta = INSECURE_PROTOCOLS[port]
                 findings.append({
@@ -342,14 +546,14 @@ class NetworkAuditor:
                     "check_name": f"Cleartext Protocol Exposed ({meta['name']})",
                     "status": "FAILED",
                     "severity": meta["severity"],
-                    "current_value": f"{meta['name']} (Port {port}/{proto}, PID {sock.pid or 'N/A'}) bound to {addr} ({proc})",
-                    "expected_value": f"{meta['name']} disabled or migrated to secure encrypted alternative (SSH/TLS)",
+                    "current_value": f"{meta['name']} (Port {port}/{proto}, PID {sock.pid or 'N/A'}) listening on {addr} ({proc})",
+                    "expected_value": f"{meta['name']} disabled or replaced with secure encrypted alternative (SSH/TLS)",
                     "target_file": "active_firewall",
                     "remediation_script": "remediate_firewall.sh",
                 })
 
-            # Check 2: Sensitive Database or Cache Exposed to Wildcard
-            if port in SENSITIVE_SERVICES and sock.is_wildcard:
+            # Check 3B: Database / Caching Service Exposed (NET_FW_002)
+            if port in SENSITIVE_SERVICES and (sock.is_wildcard or not fw_info.is_active):
                 meta = SENSITIVE_SERVICES[port]
                 findings.append({
                     "rule_id": "NET_FW_002",
@@ -359,24 +563,37 @@ class NetworkAuditor:
                     "status": "FAILED",
                     "severity": meta["severity"],
                     "current_value": f"{meta['name']} (Port {port}/{proto}) listening on wildcard {addr} ({proc})",
-                    "expected_value": f"Service bound exclusively to 127.0.0.1 or restricted via firewall policy",
+                    "expected_value": f"{meta['name']} bound strictly to 127.0.0.1 or restricted via firewall policy",
                     "target_file": "active_firewall",
                     "remediation_script": "remediate_firewall.sh",
                 })
 
-            # Check 3: Wildcard Service Exposure
-            if sock.is_wildcard and port not in INSECURE_PROTOCOLS and port not in SENSITIVE_SERVICES:
-                # Flag unhardened wildcard services
-                severity = "HIGH" if port < 1024 and port != 22 else "MEDIUM"
+            # Check 3C: Unrestricted Wildcard Binding (NET_FW_005)
+            if sock.is_wildcard and port not in INSECURE_PROTOCOLS and port not in SENSITIVE_SERVICES and port != 22:
                 findings.append({
                     "rule_id": "NET_FW_005",
                     "module": "module_2",
                     "category": "Network Exposure",
                     "check_name": "Wildcard Network Socket Binding",
                     "status": "FAILED",
-                    "severity": severity,
-                    "current_value": f"Service '{proc}' listening on {addr}:{port} ({proto.upper()})",
+                    "severity": "HIGH" if port < 1024 else "MEDIUM",
+                    "current_value": f"Service '{proc}' listening on wildcard {addr}:{port} ({proto.upper()})",
                     "expected_value": "Service bound to specific interface or localhost (127.0.0.1)",
+                    "target_file": "active_firewall",
+                    "remediation_script": "remediate_firewall.sh",
+                })
+
+            # Check 3D: SSH Exposed Unrestrictedly (NET_FW_006)
+            if port == 22 and (not fw_info.is_active or fw_info.default_inbound_policy == "ACCEPT"):
+                findings.append({
+                    "rule_id": "NET_FW_006",
+                    "module": "module_2",
+                    "category": "Network Exposure",
+                    "check_name": "Unrestricted SSH Exposure",
+                    "status": "FAILED",
+                    "severity": "HIGH",
+                    "current_value": f"SSH daemon (Port 22/{proto}) listening on {addr} without active firewall perimeter",
+                    "expected_value": "SSH traffic restricted by active firewall, rate-limiting, or VPN subnet",
                     "target_file": "active_firewall",
                     "remediation_script": "remediate_firewall.sh",
                 })
@@ -384,10 +601,32 @@ class NetworkAuditor:
         return findings
 
 
+# Public API wrapper for defensys main controller and teammates
+def audit_network(os_info: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """Entry point for DefenSys CLI to run Module 2 network auditing."""
+    auditor = NetworkAuditor()
+    return auditor.audit_network(os_info=os_info)
+
+
+def run_audit(os_info: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """Alias for audit_network adhering to common module convention."""
+    return audit_network(os_info=os_info)
+
+
 if __name__ == "__main__":
     auditor = NetworkAuditor()
-    print("[*] DefenSys Module 2: Network & Socket Auditor (Initialized)")
-    sockets = auditor.get_listening_sockets()
-    print(f"[*] Discovered {len(sockets)} listening sockets.")
-    for s in sockets:
-        print(f"    - {s.protocol.upper()} {s.local_address}:{s.local_port} ({s.process_name}) Wildcard={s.is_wildcard}")
+    print("[*] DefenSys Module 2: Network & Firewall Security Auditor")
+    print(f"[*] Detecting Firewall Manager...")
+    fw = auditor.detect_firewall_manager()
+    print(f"    - Manager: {fw.manager}")
+    print(f"    - Installed: {fw.is_installed}")
+    print(f"    - Active: {fw.is_active}")
+    print(f"    - Default Inbound Policy: {fw.default_inbound_policy}")
+
+    print(f"[*] Scanning Listening Sockets...")
+    socks = auditor.get_listening_sockets()
+    print(f"    - Discovered {len(socks)} sockets.")
+
+    findings = auditor.audit_network()
+    print(f"[*] Audit Complete. Generated {len(findings)} findings.")
+    print(json.dumps(findings, indent=2))
